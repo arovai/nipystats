@@ -550,13 +550,38 @@ def get_mask_intersect(layout, tasks):
     return intersect_masks(mask_imgs), ref_mask
 
 
+def convert_neg_log10_pvals_to_z_threshold(neg_log10_pvals_img, z_map, alpha):
+    from nilearn.image import math_img, binarize_img
+    from nilearn.masking import apply_mask
+    import numpy as np
+    above_permutation_threshold_img = math_img('img > -np.log(%s)' % alpha, img=neg_log10_pvals_img)
+    above_permutation_threshold_mask = binarize_img(above_permutation_threshold_img)
+
+    return np.min(apply_mask(z_map, above_permutation_threshold_mask))
+
 class GroupAnalysis:
-    def __init__(self, layout=None, tasks=None, concat_tasks=None, first_level_df=None,
-                 first_level_model=None, first_level_contrast=None,
-                 confounds=None, contrasts=None, bold_mask=None, model=None, ref_mask=None,
-                 design_matrix=None, contrast_maps=None,
-                 output_dir=None, covariates=None, glm=None,
-                 add_constant=False, paired=False, task_weights=None, smoothing_fwhm=8, report_options=None,
+    def __init__(self,
+                 layout=None,
+                 tasks=None,
+                 concat_tasks=None,
+                 first_level_df=None,
+                 first_level_model=None,
+                 first_level_contrast=None,
+                 confounds=None,
+                 contrasts=None,
+                 bold_mask=None,
+                 model=None,
+                 ref_mask=None,
+                 design_matrix=None,
+                 contrast_maps=None,
+                 output_dir=None,
+                 covariates=None,
+                 glm=None,
+                 add_constant=False,
+                 paired=False,
+                 task_weights=None,
+                 smoothing_fwhm=8,
+                 report_options=None,
                  contrasts_dict=None,
                  first_level_effect_maps=None):
         self.layout = layout
@@ -749,6 +774,14 @@ class GroupAnalysis:
 
         self.contrasts_dict = contrasts_dict
 
+
+    def get_thresholds(self):
+        """
+            Get thresholds
+        Returns:
+
+        """
+
     def generate_report(self, **report_options):
         """
             Wrapper for nilearn.reporting.make_glm_report. Also generate cluster table separately to read-off
@@ -766,6 +799,7 @@ class GroupAnalysis:
         from nilearn.reporting import make_glm_report
         from nilearn.reporting import get_clusters_table
         from nilearn.glm import threshold_stats_img
+        import numpy as np
 
         if type(report_options['height_control']) is not list:
             report_options['height_control'] = [report_options['height_control']]
@@ -794,17 +828,23 @@ class GroupAnalysis:
                 _rep_opts['threshold'] = float(hc['Value'])
                 hc = hc['Name']
             else:
-                if not hc == 'permutations':
+                if hc == 'permutations':
+                    _rep_opts["height_control"] = None
+                    if "alpha" in _rep_opts.keys():
+                        _rep_opts.pop("alpha")
+                    # for permutations, threshold is in principle contrast-dependent. To generate the report, we
+                    # should have different thresholds for each contrast. But the way reports works in nilearn do not
+                    # allow this. Instead, we choose to uniformly use the higher threshold, so that worst case
+                    # scenario we are too conservative. Of course, if all thresholds are equal, this also works.
+                    _rep_opts["threshold"] = np.max([self.thresholds[c]["permutations"] for c in self.contrasts])
 
+
+                else :
                     _rep_opts['height_control'] = hc
                     if 'alpha' not in _rep_opts:
                         _rep_opts['alpha'] = height_control_to_alpha[hc]
 
-            if not hc == 'permutations':
-                self.report[hc] = make_glm_report(model=self.glm, contrasts=self.contrasts, **_rep_opts, two_sided=True)
-            else:
-                msg_warning('No reports can be generated with permutation testing, as threshold depends on contrast. '
-                            '(Currently, the reports uses uniformly the threshold through all contrasts in nilearn)')
+            self.report[hc] = make_glm_report(model=self.glm, contrasts=self.contrasts, **_rep_opts, two_sided=True)
 
         for c in self.contrasts_dict.keys():
             self.cluster_table[c] = {}
@@ -836,25 +876,33 @@ class GroupAnalysis:
                 if _df.empty:
                     msg_info('No cluster for contrast %s at height threshold %s' % (c, hc))
                 else:
-                    _df['Location (Harvard-Oxford)'] = _df.apply(lambda row: get_location_HO(row), axis=1)
+                    _df['Location (Harvard-Oxford)'] = _df.apply(lambda row: get_location_harvard_oxford(row), axis=1)
                 self.cluster_table[c][hc] = _df
 
         self.report_options = report_options
 
-    def get_non_parametric_threshold(self, contrast, contrast_map, alpha=0.05, n_perm=10000):
-        from nilearn.image import math_img, binarize_img
-        from nilearn.glm.second_level import non_parametric_inference
-        from nilearn.masking import apply_mask
-        import numpy as np
-        neg_log10_pvals_img = non_parametric_inference(self.first_level_effect_maps,
-                                                       design_matrix=self.design_matrix,
-                                                       second_level_contrast=contrast,
-                                                       mask=self.bold_mask,
-                                                       smoothing_fwhm=self.model.smoothing_fwhm,
-                                                       n_perm=n_perm)
-        above_permutation_threshold_img = math_img('img > -np.log(%s)' % alpha, img=neg_log10_pvals_img)
-        above_permutation_threshold_mask = binarize_img(above_permutation_threshold_img)
-        return np.min(apply_mask(contrast_map, above_permutation_threshold_mask))
+    def get_non_parametric_threshold(self, contrast, contrast_map, alpha=0.05, n_perm=100):
+
+        if "permutations" not in self.thresholds[contrast].keys():
+
+            msg_info("Starting permutations, this might take a while... (nperm = %s)" % n_perm)
+
+            from nilearn.glm.second_level import non_parametric_inference
+
+            neg_log10_pvals_img = non_parametric_inference(self.first_level_effect_maps,
+                                                           design_matrix=self.design_matrix,
+                                                           second_level_contrast=contrast,
+                                                           mask=self.bold_mask,
+                                                           smoothing_fwhm=self.model.smoothing_fwhm,
+                                                           n_perm=n_perm)
+            non_parametric_threshold = convert_neg_log10_pvals_to_z_threshold(neg_log10_pvals_img,
+                                                   contrast_map,
+                                                   alpha)
+
+        else:
+            non_parametric_threshold = self.thresholds[contrast]["permutations"]
+
+        return non_parametric_threshold
 
     def export_to_bids(self):
 
@@ -1031,6 +1079,7 @@ def check_tasks_for_concatenation_option(args, config):
 
     return None
 
+
 def process_subject_and_task(layout, subject, task, config):
     """
 
@@ -1174,6 +1223,7 @@ def process_concatenation_of_tasks(layout, participant_analysis, config):
 
     return pa
 
+
 def run_group_analysis_from_config(rawdata, output_dir, fmriprep, config):
 
     model = config['model']
@@ -1226,7 +1276,7 @@ def read_xml(xml_file):
     return labels
 
 
-def get_location_HO(row):
+def get_location_harvard_oxford(row):
     import nibabel as nib
     x = row['X']
     y = row['Y']
