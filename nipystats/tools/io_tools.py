@@ -156,6 +156,13 @@ def read_config_file(file, analysis_level):
             if key in config_json.keys():
                 config[key] = config_json[key]
             else:
-                config[key] = None
+                if key == 'paired':
+                    config[key] = False
+                if key == 'add_constant':
+                    config[key] = False
+                if key == 'covariates':
+                    config[key] = []
+                else:
+                    config[key] = None
 
     return config

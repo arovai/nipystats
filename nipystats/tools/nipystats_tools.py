@@ -10,9 +10,9 @@ def harmonize_grid(img_list, ref_img):
     from nilearn.image import resample_to_img
 
     output = []
-    for img in img_list:
-        output.append(resample_to_img(img, ref_img, interpolation='nearest'))
-    return output
+    for i, img in enumerate(img_list):
+        img_list[i] = resample_to_img(img, ref_img, interpolation='nearest')
+    return img_list
 
 
 def round_affine(img_list, n=2):
@@ -25,26 +25,33 @@ def round_affine(img_list, n=2):
     from nibabel import Nifti1Image
     import numpy as np
     output = []
-    for m in img_list:
+    for i, m in enumerate(img_list):
         img = load_img(m)
-        _img = Nifti1Image(img.get_fdata(), affine=np.round(img.affine, n), header=img.header)
-        output.append(_img)
+        img_list[i] = Nifti1Image(img.get_fdata(), affine=np.round(img.affine, n), header=img.header)
+        #_img = Nifti1Image(img.get_fdata(), affine=np.round(img.affine, n), header=img.header)
+        #output.append(_img)
 
-    return output
+    return img_list
 
 
 def bids_init(rawdata, output, fmriprep):
     from pathlib import Path
     from bids import BIDSLayout
     from os.path import join
+
+    # create output dir
+    Path(output).mkdir(parents=True, exist_ok=True)
+
+    msg_info('Indexing BIDS dataset...')
+
     # bids init
     layout = BIDSLayout(rawdata)
 
     # add derivatives
     layout.add_derivatives(fmriprep)
 
-    # create output dir
-    Path(output).mkdir(parents=True, exist_ok=True)
+    # save
+    msg_info('Saving database at %s' % output)
 
     # initiate dataset_description file for outputs
     description = join(output, 'dataset_description.json')
@@ -515,7 +522,7 @@ def get_group_members_lists(layout, design_matrix_and_info):
     return group_members
 
 
-def get_participantlevel_info(output_layout, task, model, contrast):
+def get_participantlevel_info(output_layout, tasks, model, contrast):
     """
         Make a dataframe with participant-level information from the outputs of nipystats at first level.
 
@@ -524,13 +531,25 @@ def get_participantlevel_info(output_layout, task, model, contrast):
     df = pd.DataFrame()
     df['subject_label'] = []
     df['map_name'] = []
-    df['effects_map_path'] = []
 
-    for s in output_layout.get_subjects(**{'model': model, 'desc': contrast, 'task': task}):
-        fn = output_layout.get(model=model, desc=contrast,
+    if len(tasks) == 1:
+        df['effects_map_path'] = []
+    else:
+        for t in tasks:
+            df['effects_map_path' + '_' + t] = []
+
+    if '+' in contrast:
+        # this is a quick and dirty hack. Should fix this at first level by renaming Task1+Task2 by Task1PlusTark2 etc
+        contrast = contrast.split('+')[0]
+
+    for s in output_layout.get_subjects(**{'model': model, 'desc': contrast, 'task': tasks}):
+        fns = []
+        for t in tasks:
+            fns.append(output_layout.get(model=model, desc=contrast,
                                return_type='filename', extension='.nii.gz',
-                               task=task, suffix='EffectSize', subject=s)[0]
-        df.loc[len(df.index)] = ['sub-' + s, contrast, fn]
+                               task=t, suffix='EffectSize', subject=s)[0])
+
+        df.loc[len(df.index)] = ['sub-' + s, contrast, *fns]
 
     return df
 
@@ -542,7 +561,15 @@ def get_mask_intersect(layout, tasks):
 
     """
     from nilearn.masking import intersect_masks
-    masks = layout.derivatives['fMRIPrep'].get(desc='brain', return_type='filename', extension='.nii.gz', task=tasks,
+
+    if tasks is None:
+        msg_warning('No tasks specified. Masks from anatomical scans might be grabbed in the process, which not only '
+                    'is probably not what you want to do, but is also typically memory hungry.')
+
+    masks = layout.derivatives['fMRIPrep'].get(desc='brain',
+                                               return_type='filename',
+                                               extension='.nii.gz',
+                                               task=tasks,
                                                suffix='mask')
     ref_mask = masks[0]
     mask_imgs = round_affine(masks)
@@ -550,14 +577,35 @@ def get_mask_intersect(layout, tasks):
     return intersect_masks(mask_imgs), ref_mask
 
 
+def niimg_is_nontrivial(img):
+    """
+        Check if img has at least one non-zero value
+    Args:
+        img: niimg
+
+    Returns:
+        bool
+    """
+    from nilearn.image import load_img
+    import numpy as np
+    data = load_img(img).get_fdata()
+    return np.any(data)
+
+
 def convert_neg_log10_pvals_to_z_threshold(neg_log10_pvals_img, z_map, alpha):
-    from nilearn.image import math_img, binarize_img
+    from nilearn.image import math_img
     from nilearn.masking import apply_mask
     import numpy as np
-    above_permutation_threshold_img = math_img('img > -np.log(%s)' % alpha, img=neg_log10_pvals_img)
-    above_permutation_threshold_mask = binarize_img(above_permutation_threshold_img)
 
-    return np.min(apply_mask(z_map, above_permutation_threshold_mask))
+    above_permutation_threshold_mask = math_img('img > -np.log10(%s)' % alpha, img=neg_log10_pvals_img)
+
+    above_permutation_threshold_mask = round_affine([above_permutation_threshold_mask], 2)[0]
+
+    if niimg_is_nontrivial(above_permutation_threshold_mask):
+        return np.min(apply_mask(z_map, above_permutation_threshold_mask))
+    else:
+        return np.inf
+
 
 class GroupAnalysis:
     def __init__(self,
@@ -583,7 +631,8 @@ class GroupAnalysis:
                  smoothing_fwhm=8,
                  report_options=None,
                  contrasts_dict=None,
-                 first_level_effect_maps=None):
+                 first_level_effect_maps=None,
+                 false_postivive_control_strategies = None):
         self.layout = layout
         self.first_level_df = first_level_df
         self.first_level_model = camel_case(first_level_model)
@@ -605,6 +654,12 @@ class GroupAnalysis:
         self.report_options = report_options
         self.contrasts_dict = contrasts_dict
         self.first_level_effect_maps = first_level_effect_maps
+
+        if false_postivive_control_strategies is None:
+            # false_postivive_control_strategies = ['fpr', 'fdr', 'permutations', 'bonferroni']
+            false_postivive_control_strategies = ['fpr']
+
+        self.false_postivive_control_strategies = false_postivive_control_strategies
 
         if concat_tasks is None:
             self.n_tasks = len(tasks)
@@ -633,9 +688,12 @@ class GroupAnalysis:
         # get first-level data paths for selected contrast
         self.output_layout = self.layout.derivatives['nipystats']
         msg_info("Number of subjects found in the outputs: %s" % str(len(self.output_layout.get_subjects())))
+        msg_info("Computing intersect of all masks...")
         self.bold_mask, self.ref_mask = get_mask_intersect(self.layout, self.tasks)
-        self.glm = SecondLevelModel(mask_img=self.bold_mask, smoothing_fwhm=self.smoothing_fwhm,
-                                    target_affine=load_img(self.ref_mask).affine)
+        if self.concat_tasks is not None:
+            self.tasks = [self.concat_tasks]
+        self.glm = SecondLevelModel(mask_img=self.bold_mask, smoothing_fwhm=self.smoothing_fwhm)
+        msg_info('Setup finished.')
 
     def make_design_matrix(self):
         """
@@ -649,12 +707,12 @@ class GroupAnalysis:
         dm = pd.DataFrame()
         tasks = self.tasks
 
-        if self.n_tasks == 1:
-            # todo: merge what's here and what's just below into one single function
+        #if self.n_tasks == 1 or self.paired:
+        if self.paired:
             # What follows take information from the first-level analysis together with the participants.tsv file
             # to build a design matrix, taking into account that maybe not all subjects has an output at first level
             # as well as group-level confounds (covariates)
-            dm1 = get_participantlevel_info(self.output_layout, self.task, self.first_level_model,
+            dm1 = get_participantlevel_info(self.output_layout, self.tasks, self.first_level_model,
                                             self.first_level_contrast).sort_values('subject_label')
             dm2 = get_group_confounds(layout=self.layout, covariates=self.covariates).sort_values('subject_label')
             dm2_filtered = dm2.loc[dm2['subject_label'].isin(dm1['subject_label'])].reset_index().drop(
@@ -666,60 +724,118 @@ class GroupAnalysis:
                 # This is essentially the same as above, except that it creates at 'subject_task_label' into the
                 # design matrix. This is to keep track of the various tasks that will be involved in the model
                 # (without customization of the name, there would be ambiguities in the labels).
-                dm1 = get_participantlevel_info(self.output_layout, t, self.first_level_model,
+                dm1 = get_participantlevel_info(self.output_layout, [t], self.first_level_model,
                                                 self.first_level_contrast).sort_values('subject_label')
                 dm2 = get_group_confounds(layout=self.layout, covariates=self.covariates).sort_values('subject_label')
                 dm2_filtered = dm2.loc[dm2['subject_label'].isin(dm1['subject_label'])].reset_index().drop(
                     columns=['index'])
                 dm12 = pd.concat([dm1, dm2_filtered.drop(columns=['subject_label'])], axis=1)
                 dm12['task'] = t
-                dm12['subject_task_label'] = dm12['subject_label'].apply(camel_case) + '_task-' + t
+                # dm12['subject_task_label'] = dm12['subject_label'].apply(camel_case) + '_task-' + t
                 dm = pd.concat([dm, dm12])
+
+            # create indicator function for task - this must be done after the loop above is completed
+            for t in self.tasks:
+                dm[t] = 0
+                dm.loc[dm['task'] == t, t] = 1
+
             dm.rename(columns={0: 'subject_label'}, inplace=True)
 
-            if self.paired:
-                # This handles the cases of paired analysis
-                for t in tasks:
-                    if t not in self.task_weights.keys():
-                        msg_info('Error, task %s not in the task weights.' % t)
+            # if self.paired:
+            #    # This handles the cases of paired analysis
+            #    for t in tasks:
+            #       if t not in self.task_weights.keys():
+            #           msg_info('Error, task %s not in the task weights.' % t)
 
-                subjects = set(dm['subject_label'].values)
+                # subjects = set(dm['subject_label'].values)
 
                 # For paired designs, there must be one column per subject and per condition. Here we create such
                 # cols, naming then 'sub-<s>_task-<task>'.
                 # Moreover, the entries in the design matrix are set to what's given in task_weights
                 # (typically, to compare two tasks, weights are something like [1, -1])
-                for s in subjects:
-                    s = camel_case(s)
-                    dm[s] = 0
-                    for t in self.task_weights.keys():
-                        dm.loc[dm['subject_task_label'] == s + '_task-' + t, s] = self.task_weights[t]
 
-            else:
+                # for s in subjects:
+                #                     s = camel_case(s)
+                #                     dm[s] = 0
+                #                     for t in self.task_weights.keys():
+                #                         dm.loc[dm['subject_task_label'] == s + '_task-' + t, s] = self.task_weights[t]
+
+
+            # else:
                 # Creates an indicator function for the tasks.
-                for t in tasks:
-                    dm[t] = 0
-                    dm.loc[dm['task'] == t, t] = 1
+                #for t in tasks:
 
-            dm.drop(columns=['map_name', 'task', 'subject_task_label'], inplace=True)
+            dm.drop(columns=['map_name', 'task'], inplace=True)
 
         if self.add_constant:
             dm['constant'] = 1
 
-        self.design_matrix = dm.drop(columns=['subject_label', 'effects_map_path'])
-        self.design_matrix_and_info = dm  # remaining non-numerical cols: ['subject_label', 'effects_map_path']
+        self.design_matrix_and_info = dm.copy()  # remaining non-numerical cols: ['subject_label', 'effects_map_path' + tasks]
+
+        dm.drop(columns=['subject_label'], inplace=True)
+
+        if self.paired:
+            for t in tasks:
+                dm.drop(columns=['effects_map_path' + '_' + t], inplace=True)
+        else:
+            dm.drop(columns=['effects_map_path'], inplace=True)
+
+        self.design_matrix = dm
+
+
 
     def plot_design_matrix(self):
         from nilearn.plotting import plot_design_matrix
         plot_design_matrix(self.design_matrix)
 
+
+    def get_first_level_effect_maps(self):
+        """
+           Prepare the data from the first level analysis for the second level step.
+           Takes care of harmonizing the affines and the grids.
+
+           For paired designs, compute the difference between the maps.
+        """
+
+        from nilearn.image import load_img, math_img
+
+        df = self.design_matrix_and_info
+
+        df.sort_values('subject_label')
+
+        _list = []
+
+        if self.paired:
+            subjects = set(df['subject_label'].values)
+            for s in subjects:
+
+                t1 = self.tasks[0]
+                t2 = self.tasks[1]
+
+                img1 = df.loc[df['subject_label'] == s, 'effects_map_path' + '_' + t1].values[0]
+                img2 = df.loc[df['subject_label'] == s, 'effects_map_path' + '_' + t2].values[0]
+
+                [img1, img2] = round_affine([img1, img2])
+                [img1, img2] = harmonize_grid([img1, img2], img1)
+
+                c1 = self.task_weights[t1]
+                c2 = self.task_weights[t2]
+
+                _list.append(math_img('%s*img1 + %s*img2' % (c1, c2), img1=img1, img2=img2))
+        else:
+            _list = self.design_matrix_and_info['effects_map_path'].values
+
+        _list = round_affine(_list)
+        _list = list(harmonize_grid(_list, _list[0]))
+
+        self.first_level_effect_maps = _list
+        self.glm.target_affine = load_img(_list[0]).affine
+
     def fit(self):
 
         msg_info('Fitting model to data...')
-        rounded_ = round_affine(self.design_matrix_and_info['effects_map_path'].values)
-        _list = harmonize_grid(rounded_, rounded_[0])
-        self.first_level_effect_maps = _list
-        self.glm.fit(_list, design_matrix=self.design_matrix)
+        self.glm.fit(self.first_level_effect_maps, design_matrix=self.design_matrix)
+        msg_info('Fit complete.')
 
     def compute_contrasts(self):
 
@@ -730,40 +846,43 @@ class GroupAnalysis:
         # The nice name will be used for output names.
         contrasts_dict = {}
 
-        if self.paired:
-            # For paired designs, the contrast strings are quite involved as they typically uses all cols
-            # with 'sub-<s>_*'. Here we generate automatically such contrasts.
+        for c in self.contrasts:
+            contrasts_dict[c] = c
 
-            group_members = get_group_members_lists(self.layout, self.design_matrix_and_info)
-
-            msg_info('Contrasts automatically generated for paired analysis.')
-
-            for c in self.contrasts:
-                contrasts_dict[c] = []
-                if "+" in c:
-                    c_split = c.split("+")
-                    if len(c_split) == 2:
-                        _str = "+".join(group_members[c_split[0]]) + "+" + "+".join(group_members[c_split[1]])
-                        contrasts_dict[c] = _str
-                    else:
-                        msg_info(
-                            'Error in contrast definition, %s in not a valid value. More complicated contrasts not supported (yet...?)' % c)
-                else:
-                    if "-" in c:
-                        c_split = c.split("-")
-                        if len(c_split) == 2:
-                            _str = "+".join(group_members[c_split[0]]) + "-" + "-".join(group_members[c_split[1]])
-                            contrasts_dict[c] = _str
-                        else:
-                            msg_info(
-                                'Error in contrast definition, %s in not a valid value. More complicated contrasts not supported (yet...?)' % c)
-                    else:
-                        _str = "+".join(group_members[c])
-                        contrasts_dict[c] = _str
-            self.contrasts = list(contrasts_dict.values())  # we need this for the report generation
-        else:
-            for c in self.contrasts:
-                contrasts_dict[c] = c
+        # if self.paired:
+        #     # For paired designs, the contrast strings are quite involved as they typically uses all cols
+        #     # with 'sub-<s>_*'. Here we generate automatically such contrasts.
+        #
+        #     group_members = get_group_members_lists(self.layout, self.design_matrix_and_info)
+        #
+        #     msg_info('Contrasts automatically generated for paired analysis.')
+        #
+        #     for c in self.contrasts:
+        #         contrasts_dict[c] = []
+        #         if "+" in c:
+        #             c_split = c.split("+")
+        #             if len(c_split) == 2:
+        #                 _str = "+".join(group_members[c_split[0]]) + "+" + "+".join(group_members[c_split[1]])
+        #                 contrasts_dict[c] = _str
+        #             else:
+        #                 msg_info(
+        #                     'Error in contrast definition, %s in not a valid value. More complicated contrasts not supported (yet...?)' % c)
+        #         else:
+        #             if "-" in c:
+        #                 c_split = c.split("-")
+        #                 if len(c_split) == 2:
+        #                     _str = "+".join(group_members[c_split[0]]) + "-" + "-".join(group_members[c_split[1]])
+        #                     contrasts_dict[c] = _str
+        #                 else:
+        #                     msg_info(
+        #                         'Error in contrast definition, %s in not a valid value. More complicated contrasts not supported (yet...?)' % c)
+        #             else:
+        #                 _str = "+".join(group_members[c])
+        #                 contrasts_dict[c] = _str
+        #     self.contrasts = list(contrasts_dict.values())  # we need this for the report generation
+        # else:
+        #     for c in self.contrasts:
+        #         contrasts_dict[c] = c
 
         # ... and finally compute the actual contrasts
         self.contrast_maps = {}
@@ -773,44 +892,15 @@ class GroupAnalysis:
                                                               output_type='all')
 
         self.contrasts_dict = contrasts_dict
+        msg_info('Contrasts computed.')
 
-
-    def get_thresholds(self):
+    def compute_thresholds(self, n_perm, tfce):
         """
-            Get thresholds
-        Returns:
-
+            Get thresholds for various false positive control strategies.
         """
 
-    def generate_report(self, **report_options):
-        """
-            Wrapper for nilearn.reporting.make_glm_report. Also generate cluster table separately to read-off
-            location of clusters using Harvard-Oxford atlas (only for data in MNI space!).
-
-        Args:
-            **report_options: dict, options to pass to report and cluster table generation
-
-        Returns:
-
-        """
-
-        msg_info('Generating report(s)...')
-
-        from nilearn.reporting import make_glm_report
-        from nilearn.reporting import get_clusters_table
         from nilearn.glm import threshold_stats_img
-        import numpy as np
 
-        if type(report_options['height_control']) is not list:
-            report_options['height_control'] = [report_options['height_control']]
-
-        for i, hc in enumerate(report_options['height_control']):
-            # this is only to have our terminology compatible with nilearn's
-            if hc is None:
-                report_options['height_control'][i] = 'fpr'
-
-        self.report = {}
-        self.cluster_table = {}
         self.thresholds = {}
 
         height_control_to_alpha = {}
@@ -819,90 +909,107 @@ class GroupAnalysis:
         height_control_to_alpha['permutations'] = 0.05
         height_control_to_alpha['bonferroni'] = 0.05
 
-        for hc in report_options['height_control']:
-            _rep_opts = report_options.copy()
+        for k in self.contrasts_dict.keys():
+            self.thresholds[k] = {}
 
-            if type(hc) is dict:
-                # in this case the threshold is custom
-                _rep_opts['height_control'] = None
-                _rep_opts['threshold'] = float(hc['Value'])
-                hc = hc['Name']
-            else:
-                if hc == 'permutations':
-                    _rep_opts["height_control"] = None
-                    if "alpha" in _rep_opts.keys():
-                        _rep_opts.pop("alpha")
-                    # for permutations, threshold is in principle contrast-dependent. To generate the report, we
-                    # should have different thresholds for each contrast. But the way reports works in nilearn do not
-                    # allow this. Instead, we choose to uniformly use the higher threshold, so that worst case
-                    # scenario we are too conservative. Of course, if all thresholds are equal, this also works.
-                    _rep_opts["threshold"] = np.max([self.thresholds[c]["permutations"] for c in self.contrasts])
+            for strategy in self.false_postivive_control_strategies:
 
-
-                else :
-                    _rep_opts['height_control'] = hc
-                    if 'alpha' not in _rep_opts:
-                        _rep_opts['alpha'] = height_control_to_alpha[hc]
-
-            self.report[hc] = make_glm_report(model=self.glm, contrasts=self.contrasts, **_rep_opts, two_sided=True)
-
-        for c in self.contrasts_dict.keys():
-            self.cluster_table[c] = {}
-            self.thresholds[c] = {}
-
-            _map = self.contrast_maps[c]['z_score']
-
-            for hc in report_options['height_control']:
-
-                _thresholding_opts = {}
-                if type(hc) is dict:
-                    _thresholding_opts['height_control'] = None
-                    _thresholding_opts['threshold'] = float(hc['Value'])
-                    hc = hc['Name']
+                if strategy == 'permutations':
+                    self.get_non_parametric_threshold(contrast=k,
+                                                      alpha=height_control_to_alpha['permutations'],
+                                                      n_perm=n_perm,
+                                                      tfce=tfce)
                 else:
-                    _thresholding_opts['height_control'] = hc
-                    _thresholding_opts['alpha'] = height_control_to_alpha[hc]
+                    _, self.thresholds[k][strategy] = threshold_stats_img(stat_img=self.contrast_maps[k]['z_score'],
+                                                                          mask_img=self.bold_mask,
+                                                                          alpha=height_control_to_alpha['permutations'],
+                                                                          height_control=strategy)
 
-                if not hc == 'permutations':
-                    _, self.thresholds[c][hc] = threshold_stats_img(_map, mask_img=self.ref_mask,
-                                                                **_thresholding_opts)
-                if hc == 'permutations':
-                    self.thresholds[c][hc] = self.get_non_parametric_threshold(c,
-                                                                               _map,
-                                                                               alpha=_thresholding_opts['alpha'])
+    def generate_cluster_tables(self):
+        """
+            Wrapper for nilearn.reporting.get_cluster_table. Also finds
+            location of clusters using Harvard-Oxford atlas (only for data in MNI space!).
 
-                _df = get_clusters_table(_map, stat_threshold=self.thresholds[c][hc], two_sided=True)
+        """
+
+        from nilearn.reporting import get_clusters_table
+
+        msg_info('Generating cluster table...')
+
+        self.cluster_table = {}
+
+        for k in self.contrasts_dict.keys():
+
+            self.cluster_table[k] = {}
+
+            for false_positive_control_strategy in self.false_postivive_control_strategies:
+
+                _map = self.contrast_maps[k]['z_score']
+                threshold = self.thresholds[k][false_positive_control_strategy]
+
+                _df = get_clusters_table(_map, stat_threshold=threshold, two_sided=True)
 
                 if _df.empty:
-                    msg_info('No cluster for contrast %s at height threshold %s' % (c, hc))
+                    msg_info('No cluster for contrast %s for false positive control strategy %s' % (k,
+                                                                                                    false_positive_control_strategy))
                 else:
-                    _df['Location (Harvard-Oxford)'] = _df.apply(lambda row: get_location_harvard_oxford(row), axis=1)
-                self.cluster_table[c][hc] = _df
+                    _df = get_location_harvard_oxford_on_df(_df)
 
-        self.report_options = report_options
+                self.cluster_table[k][false_positive_control_strategy] = _df
 
-    def get_non_parametric_threshold(self, contrast, contrast_map, alpha=0.05, n_perm=100):
+    def generate_report(self):
+        """
+            Wrapper for nilearn.reporting.make_glm_report.
 
-        if "permutations" not in self.thresholds[contrast].keys():
+        """
 
-            msg_info("Starting permutations, this might take a while... (nperm = %s)" % n_perm)
+        msg_info('Generating report(s)...')
 
-            from nilearn.glm.second_level import non_parametric_inference
+        from nilearn.reporting import make_glm_report
+        import numpy as np
 
-            neg_log10_pvals_img = non_parametric_inference(self.first_level_effect_maps,
-                                                           design_matrix=self.design_matrix,
-                                                           second_level_contrast=contrast,
-                                                           mask=self.bold_mask,
-                                                           smoothing_fwhm=self.model.smoothing_fwhm,
-                                                           n_perm=n_perm)
-            non_parametric_threshold = convert_neg_log10_pvals_to_z_threshold(neg_log10_pvals_img,
-                                                   contrast_map,
-                                                   alpha)
+        self.report = {}
 
+        for hc in self.false_postivive_control_strategies:
+
+            # for permutations, threshold is in principle contrast-dependent. To generate the report, we
+            # should have different thresholds for each contrast. But the way reports works in nilearn do not
+            # allow this. Instead, we choose to uniformly use the higher threshold, so that worst case
+            # scenario we are too conservative. Of course, if all thresholds are equal, this also works.
+
+            self.report[hc] = make_glm_report(model=self.glm,
+                                              contrasts=self.contrasts,
+                                              height_control=None,
+                                              threshold=np.max([self.thresholds[k][hc] for k in self.contrasts_dict.keys()]),
+                                              two_sided=True,
+                                              cluster_threshold=10,
+                                              plot_type='glass')
+
+    def get_non_parametric_threshold(self, contrast, alpha=0.05, n_perm=10, tfce=False):
+
+        msg_info("Starting permutations, this might take a while... (nperm = %s)" % n_perm)
+
+        from nilearn.glm.second_level import non_parametric_inference
+        npi = non_parametric_inference(self.first_level_effect_maps,
+                                                       design_matrix=self.design_matrix,
+                                                       second_level_contrast=self.contrasts_dict[contrast],
+                                                       mask=self.bold_mask,
+                                                       smoothing_fwhm=self.glm.smoothing_fwhm,
+                                                       n_perm=n_perm,
+                                                       tfce=tfce)
+
+        if tfce:
+            neg_log10_pvals_img = npi['logp_max_tfce']
         else:
-            non_parametric_threshold = self.thresholds[contrast]["permutations"]
+            neg_log10_pvals_img = npi
 
-        return non_parametric_threshold
+        non_parametric_threshold = convert_neg_log10_pvals_to_z_threshold(neg_log10_pvals_img,
+                                                                          self.contrast_maps[contrast]['z_score'],
+                                                                          alpha)
+
+        msg_info('Computed threshold from permutation testing (z-score): %s' % non_parametric_threshold)
+
+        self.thresholds[contrast]["permutations"] = non_parametric_threshold
 
     def export_to_bids(self):
 
@@ -911,7 +1018,7 @@ class GroupAnalysis:
         from os.path import join
         from pathlib import Path
 
-        pattern = "model-{model}/desc-{desc}/group/group[_task-{task}]_model-{model}[_desc-{desc}][_secondLevelModel-{secondLevelModel}][_secondLevelContrast-{secondLevelContrast}]_{suffix}{extension}"
+        pattern = "model-{model}/desc-{desc}/group/[{output_type}]/group[_task-{task}]_model-{model}[_desc-{desc}][_secondLevelModel-{secondLevelModel}][_secondLevelContrast-{secondLevelContrast}]_{suffix}{extension}"
 
         maps = self.contrast_maps
 
@@ -927,6 +1034,9 @@ class GroupAnalysis:
         self.output_dir = output_dir
 
         Path(output_dir).mkdir(exist_ok=True, parents=True)
+        Path(join(output_dir, 'maps')).mkdir(exist_ok=True, parents=True)
+        Path(join(output_dir, 'cluster_tables')).mkdir(exist_ok=True, parents=True)
+        Path(join(output_dir, 'reports')).mkdir(exist_ok=True, parents=True)
         msg_info('Output directory is %s' % output_dir)
 
         for k in self.contrasts_dict.keys():
@@ -936,12 +1046,13 @@ class GroupAnalysis:
                             'desc': first_level_contrast, 'model': camel_case(first_level_model),
                             'extension': '.nii.gz',
                             'secondLevelModel': camel_case(self.model),
-                            'secondLevelContrast': camel_case(k)}
+                            'secondLevelContrast': camel_case(k),
+                            'output_type': 'maps'}
                 map_fn = output_layout.build_path(entities, pattern, validate=False)
                 maps[k][kk].to_filename(map_fn)
                 self.maps_path[k][kk] = map_fn
 
-            for hc in self.report_options['height_control']:
+            for hc in self.false_postivive_control_strategies:
                 # save also cluster tables with location in Harvard-Oxford atlas
 
                 if type(hc) is dict:
@@ -949,20 +1060,20 @@ class GroupAnalysis:
 
                 entities = {'task': task, 'suffix': camel_case('cluster table %s' % hc), 'desc': first_level_contrast,
                             'model': camel_case(first_level_model), 'secondLevelModel': camel_case(self.model),
-                            'extension': '.csv', 'secondLevelContrast': camel_case(k)}
+                            'extension': '.csv', 'secondLevelContrast': camel_case(k), 'output_type': 'cluster_tables'}
                 cluster_table_fn = output_layout.build_path(entities, pattern, validate=False)
                 self.cluster_table[k][hc].to_csv(cluster_table_fn, sep=',')
 
         self.report_path = {}
 
-        for hc in self.report_options['height_control']:
+        for hc in self.false_postivive_control_strategies:
 
             if type(hc) is dict:
                 hc = hc['Name']
 
             entities = {'task': task, 'suffix': camel_case('report %s' % hc), 'desc': first_level_contrast,
                         'model': camel_case(first_level_model), 'secondLevelModel': camel_case(self.model),
-                        'extension': '.html'}
+                        'extension': '.html', 'output_type': 'reports'}
             rep_fn = output_layout.build_path(entities, pattern, validate=False)
             msg_info('Saving report for %s to %s' % (hc, rep_fn))
             self.report[hc].save_as_html(rep_fn)
@@ -1224,7 +1335,7 @@ def process_concatenation_of_tasks(layout, participant_analysis, config):
     return pa
 
 
-def run_group_analysis_from_config(rawdata, output_dir, fmriprep, config):
+def run_group_analysis_from_config(layout, config):
 
     model = config['model']
     first_level_model = config['first_level_model']
@@ -1235,25 +1346,32 @@ def run_group_analysis_from_config(rawdata, output_dir, fmriprep, config):
     contrasts = config['contrasts']
     add_constant = config['add_constant']
     smoothing_fwhm = config['smoothing_fwhm']
-    report_options = config['report_options']
     paired = config['paired']
     task_weights = config['task_weights']
 
-    layout, _, _ = bids_init(rawdata, output_dir, fmriprep)
+    ga = GroupAnalysis(layout=layout,
+                       tasks=tasks,
+                       first_level_model=first_level_model,
+                       first_level_contrast=first_level_contrast,
+                       model=model,
+                       covariates=covariates,
+                       contrasts=contrasts,
+                       add_constant=add_constant,
+                       smoothing_fwhm=smoothing_fwhm,
+                       paired=paired,
+                       concat_tasks=concat_tasks,
+                       task_weights=task_weights,
+                       false_postivive_control_strategies=['fpr', 'fdr', 'bonferroni', 'permutations'])
+                       #false_postivive_control_strategies = ['fpr', 'fdr', 'bonferroni', 'permutations'])
 
-    # save_config(config, output_dir, model)
-
-    ga = GroupAnalysis(layout=layout, tasks=tasks, first_level_model=first_level_model,
-                       first_level_contrast=first_level_contrast, model=model, covariates=covariates,
-                       contrasts=contrasts, add_constant=add_constant, smoothing_fwhm=smoothing_fwhm,
-                       paired=paired, concat_tasks=concat_tasks, task_weights=task_weights)
     ga.setup()
     ga.make_design_matrix()
-    ga.plot_design_matrix()
+    ga.get_first_level_effect_maps()
     ga.fit()
     ga.compute_contrasts()
-    ga.plot_stat_map(threshold=3)
-    ga.generate_report(**report_options)
+    ga.compute_thresholds(n_perm=10000, tfce=True)
+    ga.generate_report()
+    ga.generate_cluster_tables()
     ga.export_to_bids()
 
 
@@ -1276,46 +1394,49 @@ def read_xml(xml_file):
     return labels
 
 
-def get_location_harvard_oxford(row):
+def get_location_harvard_oxford_on_df(df):
+
     import nibabel as nib
+    import importlib.resources
+    with importlib.resources.path('nipystats.data.atlases', 'HarvardOxford-Cortical.xml') as xml_file:
+        with importlib.resources.path('nipystats.data.atlases', 'HarvardOxford-cort-prob-1mm.nii.gz') as nifti_file:
+            # Load NIfTI file
+            nifti = nib.load(nifti_file)
+            data = nifti.get_fdata()
+            # Get affine transformation matrix
+            affine = nifti.affine
+
+            df['Location (Harvard-Oxford)'] = df.apply(lambda row: get_location_harvard_oxford(row, data, affine, xml_file), axis=1)
+    return df
+
+def get_location_harvard_oxford(row, data, affine, xml_file):
+
     x = row['X']
     y = row['Y']
     z = row['Z']
 
-    import importlib.resources
+    # Convert MNI coordinates to voxel coordinates
+    voxel_x, voxel_y, voxel_z = mni_to_voxel(x, y, z, affine)
 
-    with importlib.resources.path('nipystats.data.atlases', 'HarvardOxford-Cortical.xml') as xml_file:
-        with importlib.resources.path('nipystats.data.atlases', 'HarvardOxford-cort-prob-1mm.nii.gz') as nifti_file:
+    # Get volumes at voxel coordinates
+    volumes = data[voxel_x, voxel_y, voxel_z, :].flatten()
 
-            # Load NIfTI file
-            nifti = nib.load(nifti_file)
-            data = nifti.get_fdata()
+    # Read XML file to get label names
+    labels = read_xml(xml_file)
 
-            # Get affine transformation matrix
-            affine = nifti.affine
+    # Sort volumes by probability
+    sorted_volumes = sorted(enumerate(volumes), key=lambda x: x[1], reverse=True)
 
-            # Convert MNI coordinates to voxel coordinates
-            voxel_x, voxel_y, voxel_z = mni_to_voxel(x, y, z, affine)
+    prob_threshold = 0.01
 
-            # Get volumes at voxel coordinates
-            volumes = data[voxel_x, voxel_y, voxel_z, :].flatten()
+    # Print selected volumes with corresponding label names
 
-            # Read XML file to get label names
-            labels = read_xml(xml_file)
+    output = []
 
-            # Sort volumes by probability
-            sorted_volumes = sorted(enumerate(volumes), key=lambda x: x[1], reverse=True)
+    for index, prob in sorted_volumes:
+        label_name = labels.get(index, "Unknown")
+        if prob > prob_threshold:
+            _str = f"{label_name} ({prob} %)"
+            output.append(_str)
 
-            prob_threshold = 0.01
-
-            # Print selected volumes with corresponding label names
-
-            output = []
-
-            for index, prob in sorted_volumes:
-                label_name = labels.get(index, "Unknown")
-                if prob > prob_threshold:
-                    _str = f"{label_name} ({prob} %)"
-                    output.append(_str)
-
-            return ' and '.join(output)
+    return ' and '.join(output)
