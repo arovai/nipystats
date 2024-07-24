@@ -1,5 +1,5 @@
 from .shell_tools import *
-
+from .permutation_testing_tools import apply_permutation_on_design_matrix
 
 def harmonize_grid(img_list, ref_img):
     """
@@ -93,11 +93,48 @@ def camel_case(s, lower=False):
     return out_s
 
 
-def concat_fmri(imgs):
-    from nilearn import image
-    clean_imgs = [image.clean_img(_i, standardize=True, detrend=True) for _i in imgs]
+def demean_fmri(img):
+    from nilearn.image import load_img
+    import numpy as np
+    from nibabel import Nifti1Image
+    if type(img) is str:
+        img = load_img(img)
+    original_data = img.get_fdata()
+    data = np.zeros_like(original_data)
 
-    return image.concat_imgs(clean_imgs, auto_resample=True)
+    nx, ny, nz, _ = img.shape
+
+    mean = np.mean(original_data)
+
+    for x in np.arange(nx):
+        for y in np.arange(ny):
+            for z in np.arange(nz):
+                data[x, y, z, :] = original_data[x, y, z, :] - mean
+
+    return Nifti1Image(data, header=img.header, affine=img.affine)
+
+def concat_fmri(imgs, **kwargs):
+    from nilearn import image
+
+    # de-trend and high-pass
+
+    if kwargs['high_pass'] is not None:
+        msg_warning('High pass and t_r are assumed to be the same for the sessions to concatenate.')
+        # todo: generalize with different t_r and high_pass values for each session to concatenate
+
+    imgs = [image.clean_img(
+                            i,
+                            standardize=False,
+                            detrend=True,
+                            **kwargs
+                            )
+                            for i in imgs]
+
+    # remove mean (clean_img with high_pass does not remove mean!)
+
+    imgs = [demean_fmri(i) for i in imgs]
+
+    return image.concat_imgs(imgs, auto_resample=True)
 
 
 def make_block_design_matrix(dm1, dm2):
@@ -152,7 +189,9 @@ class ParticipantAnalysis:
                  layout=None,
                  output_dir=None,
                  confounds=None,
-                 model_name=None):
+                 model_name=None,
+                 t_r=None,
+                 high_pass=None):
         self.dataset_path = dataset_path
         self.subject = subject
         self.task_label = task_label
@@ -170,6 +209,8 @@ class ParticipantAnalysis:
         self.output_dir = output_dir
         self.confounds = confounds
         self.model_name = model_name
+        self.t_r = t_r
+        self.high_pass = high_pass
 
     def setup(self, dataset_path=None, task_label=None, subject=None, derivatives_folder=None, first_level_options=None):
         """
@@ -264,7 +305,7 @@ class ParticipantAnalysis:
         else:
             if self.bold_mask is None:
                 self.load_bold_mask()
-            self.model = FirstLevelModel(mask_img = self.bold_mask, **self.first_level_options)
+            self.model = FirstLevelModel(mask_img=self.bold_mask, **self.first_level_options)
             self.model.fit(run_imgs=self.imgs, design_matrices=self.design_matrix)
 
         self.is_fit_ = True
@@ -306,7 +347,7 @@ class ParticipantAnalysis:
                 map = self.contrast_maps[c]['stat']
                 plot_stat_map(map, threshold=threshold, title="%s, %s, %s (statistic)" % (c, sub, task))
 
-    def generate_report(self, report_options):
+    def generate_report(self, report_options=None):
         """
             Wrapper for FirstLevelModel.generate_report()
 
@@ -632,7 +673,9 @@ class GroupAnalysis:
                  report_options=None,
                  contrasts_dict=None,
                  first_level_effect_maps=None,
-                 false_postivive_control_strategies = None):
+                 false_postivive_control_strategies=None,
+                 permutation_columns=None,
+                 custom_z_threshold=None):
         self.layout = layout
         self.first_level_df = first_level_df
         self.first_level_model = camel_case(first_level_model)
@@ -654,6 +697,8 @@ class GroupAnalysis:
         self.report_options = report_options
         self.contrasts_dict = contrasts_dict
         self.first_level_effect_maps = first_level_effect_maps
+        self.permutation_columns = permutation_columns
+        self.custom_z_threshold = custom_z_threshold
 
         if false_postivive_control_strategies is None:
             # false_postivive_control_strategies = ['fpr', 'fdr', 'permutations', 'bonferroni']
@@ -734,10 +779,11 @@ class GroupAnalysis:
                 # dm12['subject_task_label'] = dm12['subject_label'].apply(camel_case) + '_task-' + t
                 dm = pd.concat([dm, dm12])
 
-            # create indicator function for task - this must be done after the loop above is completed
-            for t in self.tasks:
-                dm[t] = 0
-                dm.loc[dm['task'] == t, t] = 1
+            if len(self.tasks) > 1:
+                # create indicator function for task - this must be done after the loop above is completed
+                for t in self.tasks:
+                    dm[t] = 0
+                    dm.loc[dm['task'] == t, t] = 1
 
             dm.rename(columns={0: 'subject_label'}, inplace=True)
 
@@ -769,6 +815,12 @@ class GroupAnalysis:
 
         if self.add_constant:
             dm['constant'] = 1
+
+            if self.covariates is not None and len(self.covariates) > 0:
+                for cov in self.covariates:
+                    # remove mean to numerical entries
+                    import numpy as np
+                    dm[cov] = dm[cov].values - np.mean(dm[cov].values)
 
         self.design_matrix_and_info = dm.copy()  # remaining non-numerical cols: ['subject_label', 'effects_map_path' + tasks]
 
@@ -894,7 +946,7 @@ class GroupAnalysis:
         self.contrasts_dict = contrasts_dict
         msg_info('Contrasts computed.')
 
-    def compute_thresholds(self, n_perm, tfce):
+    def compute_thresholds(self, n_perm=10, tfce=False):
         """
             Get thresholds for various false positive control strategies.
         """
@@ -915,15 +967,19 @@ class GroupAnalysis:
             for strategy in self.false_postivive_control_strategies:
 
                 if strategy == 'permutations':
-                    self.get_non_parametric_threshold(contrast=k,
-                                                      alpha=height_control_to_alpha['permutations'],
-                                                      n_perm=n_perm,
-                                                      tfce=tfce)
+                    #self.get_non_parametric_threshold(contrast=k,
+                    #                                  alpha=height_control_to_alpha['permutations'],
+                    #                                  n_perm=n_perm,
+                    #                                  tfce=tfce)
+                    self.run_permutation_testing(contrast=k, n_perm=n_perm)
+                elif strategy == 'custom':
+                    self.thresholds[k][strategy] = self.custom_z_threshold
                 else:
                     _, self.thresholds[k][strategy] = threshold_stats_img(stat_img=self.contrast_maps[k]['z_score'],
                                                                           mask_img=self.bold_mask,
-                                                                          alpha=height_control_to_alpha['permutations'],
-                                                                          height_control=strategy)
+                                                                          alpha=height_control_to_alpha[strategy],
+                                                                          height_control=strategy,
+                                                                          two_sided=True)
 
     def generate_cluster_tables(self):
         """
@@ -985,6 +1041,23 @@ class GroupAnalysis:
                                               cluster_threshold=10,
                                               plot_type='glass')
 
+    def run_permutation_testing(self, contrast, alpha=0.05, n_perm=10):
+
+        permuted_max_t_values = []
+        for _ in range(n_perm):
+
+            permuted_model = self.glm
+            shuffled_design_matrix = apply_permutation_on_design_matrix(design_matrix=permuted_model.design_matrix_,
+                                                                              cols=self.permutation_columns)
+            permuted_model.fit(self.first_level_effect_maps, design_matrix=shuffled_design_matrix)
+
+            maps = permuted_model.compute_contrast(second_level_contrast=contrast,
+                                            first_level_contrast=self.first_level_contrast,
+                                            output_type='all')
+            permuted_max_t_values.append(get_max_in_niimg(maps['stat']))
+
+        permuted_max_t_values
+
     def get_non_parametric_threshold(self, contrast, alpha=0.05, n_perm=10, tfce=False):
 
         msg_info("Starting permutations, this might take a while... (nperm = %s)" % n_perm)
@@ -996,7 +1069,8 @@ class GroupAnalysis:
                                                        mask=self.bold_mask,
                                                        smoothing_fwhm=self.glm.smoothing_fwhm,
                                                        n_perm=n_perm,
-                                                       tfce=tfce)
+                                                       tfce=tfce,
+                                                       two_sided_test=True)
 
         if tfce:
             neg_log10_pvals_img = npi['logp_max_tfce']
@@ -1164,7 +1238,7 @@ def concat_ParticipantAnalyses(pa1, pa2):
 
     pa12.design_matrix = dm12
 
-    pa12.imgs = concat_fmri([pa1.imgs, pa2.imgs])
+    pa12.imgs = concat_fmri([pa1.imgs, pa2.imgs], high_pass=pa1.high_pass, t_r=pa1.t_r)
 
     pa12.dataset_path = pa1.dataset_path
     pa12.layout = pa1.layout
@@ -1224,6 +1298,32 @@ def process_subject_and_task(layout, subject, task, config):
     return pa
 
 
+def get_repetition_time(layout, subject, task):
+    """
+        Find repetition time for subject and task, as read in json file.
+
+    Args:
+        layout: BIDSLayout
+        subject: string
+        task: string
+
+    Returns:
+        float
+    """
+
+    import json
+    fn = layout.get(extension='json', scope='root', subject=subject, task=task)
+    if len(fn) > 0:
+        msg_error('Several json files found for %s, %s' % (subject, task))
+    else:
+        fn = fn[0]
+
+    with open(fn, 'r') as f:
+        info = json.load(f)
+
+    return float(info['RepetitionTime'])
+
+
 def run_analysis_from_config(rawdata, output_dir, subjects, fmriprep, config):
 
     _model = config['model']
@@ -1272,6 +1372,9 @@ def run_analysis_from_config(rawdata, output_dir, subjects, fmriprep, config):
 
                 pa1 = pa[t1]
                 pa2 = pa[t2]
+
+                pa1.high_pass = config['high_pass']
+                pa1.t_r = get_repetition_time(layout=layout, subject=s, task=t1)
 
                 pa12 = concat_ParticipantAnalyses(pa1, pa2)
                 pa12.fit()
@@ -1335,6 +1438,10 @@ def process_concatenation_of_tasks(layout, participant_analysis, config):
     return pa
 
 
+def get_max_in_niimg(img):
+    import numpy as np
+    return np.nanmax(img.get_fdata())
+
 def run_group_analysis_from_config(layout, config):
 
     model = config['model']
@@ -1348,6 +1455,8 @@ def run_group_analysis_from_config(layout, config):
     smoothing_fwhm = config['smoothing_fwhm']
     paired = config['paired']
     task_weights = config['task_weights']
+    permutation_columns = config['permutation_columns']
+    custom_z_threshold = config['custom_z_threshold']
 
     ga = GroupAnalysis(layout=layout,
                        tasks=tasks,
@@ -1361,15 +1470,16 @@ def run_group_analysis_from_config(layout, config):
                        paired=paired,
                        concat_tasks=concat_tasks,
                        task_weights=task_weights,
-                       false_postivive_control_strategies=['fpr', 'fdr', 'bonferroni', 'permutations'])
-                       #false_postivive_control_strategies = ['fpr', 'fdr', 'bonferroni', 'permutations'])
+                       false_postivive_control_strategies=['fpr', 'fdr', 'bonferroni', 'custom'],
+                       permutation_columns=permutation_columns,
+                       custom_z_threshold=custom_z_threshold)
 
     ga.setup()
     ga.make_design_matrix()
     ga.get_first_level_effect_maps()
     ga.fit()
     ga.compute_contrasts()
-    ga.compute_thresholds(n_perm=10000, tfce=True)
+    ga.compute_thresholds()
     ga.generate_report()
     ga.generate_cluster_tables()
     ga.export_to_bids()
