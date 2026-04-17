@@ -586,11 +586,17 @@ def get_participantlevel_info(output_layout, tasks, model, contrast):
     for s in output_layout.get_subjects(**{'model': model, 'desc': contrast, 'task': tasks}):
         fns = []
         for t in tasks:
-            fns.append(output_layout.get(model=model, desc=contrast,
+            results = output_layout.get(model=model, desc=contrast,
                                return_type='filename', extension='.nii.gz',
-                               task=t, suffix='EffectSize', subject=s)[0])
-
-        df.loc[len(df.index)] = ['sub-' + s, contrast, *fns]
+                               task=t, suffix='EffectSize', subject=s)
+            if len(results)>0:
+                fns.append(results[0])
+        # todo: here we must solve the issue as for P22, for which just one task is missing. Do not add it, but then adapt for paired analysis. Also understand why I
+        # got no error for the other models.
+        if len(fns) == len(tasks):
+            df.loc[len(df.index)] = ['sub-' + s, contrast, *fns]
+        else:
+            msg_warning('Subject %s does not seem to have all the tasks, not including it in the analysis.' % s)
 
     return df
 
@@ -679,7 +685,7 @@ class GroupAnalysis:
         self.layout = layout
         self.first_level_df = first_level_df
         self.first_level_model = camel_case(first_level_model)
-        self.first_level_contrast = camel_case(first_level_contrast)
+        self.first_level_contrast = first_level_contrast
         self.contrasts = contrasts
         self.confounds = confounds
         self.bold_mask = bold_mask
@@ -834,12 +840,9 @@ class GroupAnalysis:
 
         self.design_matrix = dm
 
-
-
     def plot_design_matrix(self):
         from nilearn.plotting import plot_design_matrix
         plot_design_matrix(self.design_matrix)
-
 
     def get_first_level_effect_maps(self):
         """
